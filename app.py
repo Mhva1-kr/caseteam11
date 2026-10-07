@@ -48,7 +48,7 @@ def haversine_distance(lat1, lon1, lat2=52.3105, lon2=4.7683):
 
 
 # ==========================================
-# 3. ROBUUST DATA INLADEN (ZONDER DUBBELE KOLOMMEN)
+# 3. ROBUUST DATA INLADEN & SLIMME KOLOM MATCHING
 # ==========================================
 @st.cache_data
 def load_data():
@@ -77,7 +77,7 @@ def load_data():
         else:
             df = pd.read_csv(target_file)
 
-        # Verwijder eventuele dubbele kolomnamen vooraf uit de CSV
+        # Verwijder dubbele kolommen uit het originele bestand
         df = df.loc[:, ~df.columns.duplicated()]
 
         rename_dict = {}
@@ -90,46 +90,49 @@ def load_data():
                 .replace("_", "")
                 .replace(" ", "")
                 .replace("-", "")
+                .replace(".", "")
             )
 
             target = None
 
-            # Delay / Vertraging
+            # 1. Delay / Vertraging
             if any(
                 k in c_clean
                 for k in [
-                    "delayminutes",
-                    "vertragingmin",
+                    "delay",
+                    "vertraging",
+                    "vertraagd",
                     "depdelay",
                     "arrdelay",
-                    "vertraging",
-                    "delay",
+                    "delayminutes",
                 ]
             ):
                 target = "Delay"
 
-            # Destination / Bestemming
+            # 2. Destination / Bestemming
             elif any(
                 k in c_clean
                 for k in [
                     "destination",
                     "bestemming",
-                    "arrivalairport",
+                    "arrival",
                     "destiata",
                     "orgdes",
+                    "airport",
                     "dest",
+                    "iata",
                 ]
             ):
                 target = "Destination"
 
-            # Latitude
+            # 3. Latitude
             elif any(
                 k in c_clean
                 for k in ["latitude", "lat", "breedtegraad", "destlat"]
             ):
                 target = "Latitude"
 
-            # Longitude
+            # 4. Longitude
             elif any(
                 k in c_clean
                 for k in [
@@ -138,37 +141,42 @@ def load_data():
                     "lng",
                     "lengtegraad",
                     "destlon",
-                    "destlng",
                 ]
             ):
                 target = "Longitude"
 
-            # Distance / Afstand
+            # 5. Distance / Afstand
             elif any(k in c_clean for k in ["distance", "afstand", "dist"]):
                 target = "Distance"
 
-            # Airline / Luchtvaartmaatschappij
+            # 6. Airline / Luchtvaartmaatschappij
             elif any(
                 k in c_clean
-                for k in ["airline", "carrier", "luchtvaartmaatschappij"]
+                for k in [
+                    "airline",
+                    "carrier",
+                    "luchtvaartmaatschappij",
+                    "operator",
+                ]
             ):
                 target = "Airline"
 
-            # DateTime / Datum / Tijd
+            # 7. DateTime / Datum / Tijd
             elif any(
                 k in c_clean
                 for k in [
                     "datetime",
-                    "stastdltc",
-                    "stdltc",
-                    "staltc",
-                    "scheduled",
+                    "scheduledatetime",
+                    "actualdatetime",
                     "datum",
+                    "tijd",
+                    "std",
+                    "sta",
                 ]
             ):
                 target = "DateTime"
 
-            # Weer variabelen (specifieke woorden, GEEN 't' als losse letter!)
+            # 8. KNMI Weer Variabelen
             elif any(
                 k in c_clean for k in ["windspeed", "windsnelheid", "wind"]
             ):
@@ -184,17 +192,44 @@ def load_data():
             elif any(k in c_clean for k in ["visibility", "zicht"]):
                 target = "Visibility"
 
-            # Zorg ervoor dat elke doeltitel maximaal 1x wordt toegewezen
             if target and target not in used_targets:
                 rename_dict[col] = target
                 used_targets.add(target)
 
         df = df.rename(columns=rename_dict)
-
-        # Failsafe: strikt dubbele kolomnamen opschonen voor PyArrow
         df = df.loc[:, ~df.columns.duplicated()]
 
-        # Automatische verwerking van types
+        # automatische vertragingsberekening als er geplande vs werkelijke tijden zijn
+        if "Delay" not in df.columns:
+            time_cols = [
+                c
+                for c in df.columns
+                if any(
+                    k in c.lower()
+                    for k in [
+                        "time",
+                        "tijd",
+                        "date",
+                        "std",
+                        "sta",
+                        "etd",
+                        "eta",
+                        "schedule",
+                        "actual",
+                    ]
+                )
+            ]
+            if len(time_cols) >= 2:
+                try:
+                    t1 = pd.to_datetime(df[time_cols[0]], errors="coerce")
+                    t2 = pd.to_datetime(df[time_cols[1]], errors="coerce")
+                    diff_min = (t2 - t1).dt.total_seconds() / 60.0
+                    if diff_min.notna().sum() > 0:
+                        df["Delay"] = diff_min.clip(lower=0)
+                except Exception:
+                    pass
+
+        # Converteer en verwerk types
         if "Delay" in df.columns:
             df["Delay"] = pd.to_numeric(df["Delay"], errors="coerce").fillna(0)
 
@@ -225,9 +260,29 @@ if df is None:
 
 
 # ==========================================
-# 4. INTERACTIVE FILTERS (SIDEBAR)
+# 4. HANDMATIGE KOLOM KOPPELING (SIDEBAR FALLBACK)
 # ==========================================
 st.sidebar.markdown("## 🔍 Interactive Filters")
+
+# Als 'Delay' of 'Destination' niet automatisch is gekoppeld, bieden we een handmatige selector
+if "Delay" not in df.columns or "Destination" not in df.columns:
+    with st.sidebar.expander("⚙️ Kolommen handmatig toewijzen", expanded=True):
+        st.write("Koppel de kolommen uit je CSV aan het dashboard:")
+
+        all_cols = ["-- Selecteer Kolom --"] + list(df.columns)
+
+        if "Delay" not in df.columns:
+            sel_delay = st.selectbox("Vertragingskolom (minuten):", all_cols)
+            if sel_delay != "-- Selecteer Kolom --":
+                df["Delay"] = pd.to_numeric(
+                    df[sel_delay], errors="coerce"
+                ).fillna(0)
+
+        if "Destination" not in df.columns:
+            sel_dest = st.selectbox("Bestemmingskolom:", all_cols)
+            if sel_dest != "-- Selecteer Kolom --":
+                df["Destination"] = df[sel_dest]
+
 filtered_df = df.copy()
 
 # Filter: Luchtvaartmaatschappij
@@ -235,7 +290,7 @@ if "Airline" in filtered_df.columns:
     airlines = ["Alles"] + sorted(
         filtered_df["Airline"].dropna().astype(str).unique().tolist()
     )
-    sel_airline = st.sidebar.selectbox("Selecteer Luchtvaartmaatschappij:", airlines)
+    sel_airline = st.sidebar.selectbox("Luchtvaartmaatschappij:", airlines)
     if sel_airline != "Alles":
         filtered_df = filtered_df[filtered_df["Airline"] == sel_airline]
 
@@ -244,7 +299,7 @@ if "Destination" in filtered_df.columns:
     destinations = ["Alles"] + sorted(
         filtered_df["Destination"].dropna().astype(str).unique().tolist()
     )
-    sel_dest = st.sidebar.selectbox("Selecteer Bestemming:", destinations)
+    sel_dest = st.sidebar.selectbox("Bestemming:", destinations)
     if sel_dest != "Alles":
         filtered_df = filtered_df[filtered_df["Destination"] == sel_dest]
 
@@ -326,7 +381,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 with tab1:
     st.subheader("📈 Verloop en Trends van Vertragingen")
 
-    if "Delay" in filtered_df.columns and filtered_df["Delay"].nunique() > 1:
+    if "Delay" in filtered_df.columns and filtered_df["Delay"].sum() > 0:
         c1, c2 = st.columns(2)
 
         with c1:
@@ -373,8 +428,9 @@ with tab1:
             )
             st.plotly_chart(fig_line, use_container_width=True)
     else:
-        st.info(
-            "ℹ️ Geen vertragingskolom gevonden. Bekijk de tab '📡 Vluchttelemetrie & Data Inspectie' voor alle aanwezige kolomnamen."
+        st.warning(
+            "⚠️ Vertragingskolom nog niet gekoppeld. Open de sidebar links onder "
+            "**'⚙️ Kolommen handmatig toewijzen'** om de juiste vertragingskolom te selecteren."
         )
 
 
@@ -513,8 +569,20 @@ with tab4:
             pred = rf_model.predict(pd.DataFrame([input_data]))[0]
             st.metric("⏱️ Voorspelde Vertraging", f"{max(0, pred):.1f} min")
         else:
-            st.warning(
-                "Niet genoeg data om een betrouwbaar ML-model te trainen. "
-                "Minimaal 50 rijen met geldige waarden zijn vereist."
-            )
-            
+            st.warning("Onvoldoende schone data om het model te trainen.")
+    else:
+        st.info("Onvoldoende feature kolommen aanwezig voor voorspellingen.")
+
+
+# ------------------------------------------
+# TAB 5: VLUCHTTELEMETRIE & DATA INSPECTIE
+# ------------------------------------------
+with tab5:
+    st.subheader("📡 Vluchttelemetrie & Data Inspectie")
+
+    st.markdown("### 📋 Alle Kolommen in jouw CSV-bestand:")
+    st.write(list(df.columns))
+
+    st.markdown("### 🔍 Eerste 500 rijen van de dataset:")
+    st.dataframe(filtered_df.head(500), use_container_width=True)
+    
