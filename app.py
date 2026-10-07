@@ -5,6 +5,7 @@ import zipfile
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import pydeck as pdk
 import streamlit as st
 from sklearn.ensemble import HistGradientBoostingRegressor
@@ -13,27 +14,34 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder
 
 # ==========================================
-# 1. PAGE CONFIGURATION & STYLING
+# 1. STREAMLIT PAGINA CONFIGURATIE
 # ==========================================
 st.set_page_config(
-    page_title="Schiphol Flight & Delay Analytics",
+    page_title="Zürich Airport (ZRH) - Vluchten & Vertraging Dashboard",
     page_icon="✈️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("✈️ Schiphol Vlucht, Weer & Vertraging Dashboard")
+# Coördinaten Zürich Airport (ZRH / LSZH: Zürich-Kloten)
+ZRH_LAT, ZRH_LON = 47.4582, 8.5554
+
+# Header
+st.title("✈️ Zürich Airport (ZRH) — Vluchten, Weer & Vertraging Dashboard")
 st.markdown(
-    """*Een integraal dataplaatje waarin vluchtdata, KNMI-weeromstandigheden, """
-    """wereldwijde luchthavencoördinaten en vluchttelemetrie samenkomen.*"""
+    """
+    **Case 3: Minor Data Science & Visual Analytics**  
+    *Een integraal dashboard waarin 323.461 vluchten van/naar Zürich Airport, Meteostat weeromstandigheden (station 06670), 
+    OpenFlights luchthavencoördinaten en hoge-resolutie vluchttelemetrie samenkomen.*
+    """
 )
 
 
 # ==========================================
-# 2. HELPER FUNCTIONS & HAVERSINE DISTANCE
+# 2. HELPER FUNCTIES & AFSTANDSBEREKENING (VINCENTY & HAVERSINE)
 # ==========================================
-def haversine_distance(lat1, lon1, lat2, lon2):
-    """Berekent de afstand in kilometers tussen twee geografische coördinaten."""
+def haversine_distance_vectorized(lat1, lon1, lat2, lon2):
+    """Snelle gevectoriseerde Haversine afstandsberekening in kilometers."""
     R = 6371.0  # Straal van de aarde in km
     dlat = np.radians(lat2 - lat1)
     dlon = np.radians(lon2 - lon1)
@@ -43,20 +51,88 @@ def haversine_distance(lat1, lon1, lat2, lon2):
         * np.cos(np.radians(lat2))
         * np.sin(dlon / 2.0) ** 2
     )
-    c = 2 * np.arcsin(np.sqrt(a))
+    c = 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
     return R * c
 
 
-# Coördinaten Schiphol (AMS / EHAM)
-AMS_LAT, AMS_LON = 52.3105, 4.7683
+def vincenty_distance(lat1, lon1, lat2, lon2):
+    """Berekent de precieze geodetische afstand volgens de Vincenty formule (met Haversine fallback)."""
+    if pd.isna(lat1) or pd.isna(lon1) or pd.isna(lat2) or pd.isna(lon2):
+        return np.nan
+
+    a = 6378137.0  # WGS-84 semi-major axis in meters
+    f = 1 / 298.257223563  # WGS-84 flattening
+    b = (1 - f) * a
+
+    phi1, phi2 = np.radians(lat1), np.radians(lat2)
+    L = np.radians(lon2 - lon1)
+
+    U1 = np.arctan((1 - f) * np.tan(phi1))
+    U2 = np.arctan((1 - f) * np.tan(phi2))
+    sinU1, cosU1 = np.sin(U1), np.cos(U1)
+    sinU2, cosU2 = np.sin(U2), np.cos(U2)
+
+    lambda_lon = L
+    for _ in range(100):
+        sin_lambda = np.sin(lambda_lon)
+        cos_lambda = np.cos(lambda_lon)
+        sin_sigma = np.sqrt(
+            (cosU2 * sin_lambda) ** 2
+            + (cosU1 * sinU2 - sinU1 * cosU2 * cos_lambda) ** 2
+        )
+        if sin_sigma == 0:
+            return 0.0
+        cos_sigma = sinU1 * sinU2 + cosU1 * cosU2 * cos_lambda
+        sigma = np.arctan2(sin_sigma, cos_sigma)
+        sin_alpha = cosU1 * cosU2 * sin_lambda / sin_sigma
+        cos2_alpha = 1 - sin_alpha**2
+        cos2_sigma_m = (
+            cos_sigma - 2 * sinU1 * sinU2 / cos2_alpha
+            if cos2_alpha != 0
+            else 0.0
+        )
+
+        C = f / 16 * cos2_alpha * (4 + f * (4 - 3 * cos2_alpha))
+        lambda_prev = lambda_lon
+        lambda_lon = L + (1 - C) * f * sin_alpha * (
+            sigma
+            + C
+            * sin_sigma
+            * (cos2_sigma_m + C * cos_sigma * (-1 + 2 * cos2_sigma_m**2))
+        )
+        if abs(lambda_lon - lambda_prev) < 1e-12:
+            break
+    else:
+        return haversine_distance_vectorized(lat1, lon1, lat2, lon2)
+
+    u2 = cos2_alpha * (a**2 - b**2) / (b**2)
+    A = 1 + u2 / 16384 * (4096 + u2 * (-768 + u2 * (320 - 175 * u2)))
+    B = u2 / 1024 * (256 + u2 * (-128 + u2 * (74 - 47 * u2)))
+    delta_sigma = (
+        B
+        * sin_sigma
+        * (
+            cos2_sigma_m
+            + 0.25
+            * B
+            * (
+                cos_sigma * (-1 + 2 * cos2_sigma_m**2)
+                - B
+                / 6
+                * cos2_sigma_m
+                * (-3 + 4 * sin_sigma**2)
+                * (-3 + 4 * cos2_sigma_m**2)
+            )
+        )
+    )
+    return (b * A * (sigma - delta_sigma)) / 1000.0
 
 
 def safe_read_csv_or_zip(file_path, header="infer"):
-    """Probeert een bestand veilig in te lezen, of het nu een ZIP of CSV is."""
+    """Beveiligde lezer die ZIP, CSV of GZ leest zonder te crashen op corrupte LFS-files."""
     if not os.path.exists(file_path):
         return None
 
-    # Check of het bestand een echt ZIP-bestand is
     if zipfile.is_zipfile(file_path):
         try:
             with zipfile.ZipFile(file_path, "r") as z:
@@ -70,7 +146,6 @@ def safe_read_csv_or_zip(file_path, header="infer"):
         except Exception:
             pass
 
-    # Direct inlezen met Pandas (voor normale CSV's of direct door Pandas ondersteunde formaten)
     try:
         return pd.read_csv(file_path, header=header)
     except Exception:
@@ -78,18 +153,18 @@ def safe_read_csv_or_zip(file_path, header="infer"):
 
 
 # ==========================================
-# 3. DATA LOADING & PREPROCESSING PIPELINE
+# 3. PIPELINE MET CACHING VOOR DATA PREPROCESSING
 # ==========================================
 @st.cache_data
 def load_and_clean_data():
-    # A. Schedule Airport Data
+    # A. Schedule Airport Data (Zürich)
     df_sched = None
     candidate_paths = [
+        "schedule_airport.csv",
         "schedule_airport.zip",
         "schedule_airport.csv.zip",
-        "data/schedule_airport.zip",
-        "schedule_airport.csv",
         "data/schedule_airport.csv",
+        "data/schedule_airport.zip",
     ]
 
     for path in candidate_paths:
@@ -99,30 +174,33 @@ def load_and_clean_data():
 
     if df_sched is None or df_sched.empty:
         st.error(
-            "⚠️ Kan 'schedule_airport' data niet inlezen. "
-            "Controleer of het bestand aanwezig is op GitHub/Streamlit Cloud en geen beschadigde Git LFS pointer is."
+            "⚠️ Het bestand 'schedule_airport.csv' kon niet worden ingelezen. "
+            "Plaats de dataset in de hoofdmap van het project."
         )
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # Datum en Tijd Conversies
+    # Datum- en Tijdconversie
     df_sched["STD_DT"] = pd.to_datetime(
         df_sched["STD"], format="%d/%m/%Y", errors="coerce"
     )
+
+    # Tijdstempels samenvoegen
     df_sched["Sched_Time"] = pd.to_datetime(
-        df_sched["STD"] + " " + df_sched["STA_STD_ltc"],
+        df_sched["STD"].astype(str) + " " + df_sched["STA_STD_ltc"].astype(str),
         format="%d/%m/%Y %H:%M:%S",
         errors="coerce",
     )
     df_sched["Act_Time"] = pd.to_datetime(
-        df_sched["STD"] + " " + df_sched["ATA_ATD_ltc"],
+        df_sched["STD"].astype(str) + " " + df_sched["ATA_ATD_ltc"].astype(str),
         format="%d/%m/%Y %H:%M:%S",
         errors="coerce",
     )
 
-    # Vertraging berekenen in minuten + opschonen midnight rollover
+    # Berekening van de werkelijke vertraging in minuten (+ middernacht rollover correctie)
     df_sched["Vertraging_Minuten"] = (
         df_sched["Act_Time"] - df_sched["Sched_Time"]
     ).dt.total_seconds() / 60.0
+
     df_sched.loc[df_sched["Vertraging_Minuten"] < -720, "Vertraging_Minuten"] += (
         1440
     )
@@ -138,22 +216,23 @@ def load_and_clean_data():
         df_sched["Org/Des"].astype(str).str.strip().str.upper()
     )
 
-    # B. Airports Extended Data
+    # B. Airports Extended Data (OpenFlights / Kaggle)
     df_airports = None
     airport_paths = [
-        "airports-extended.csv.zip",
+        "airports-extended-clean.csv",
         "airports-extended.csv",
-        "data/airports-extended.csv.zip",
+        "airports-extended.csv.zip",
+        "data/airports-extended-clean.csv",
         "data/airports-extended.csv",
     ]
 
     for path in airport_paths:
-        df_airports = safe_read_csv_or_zip(path, header=None)
+        df_airports = safe_read_csv_or_zip(path)
         if df_airports is not None and not df_airports.empty:
             break
 
     if df_airports is not None and not df_airports.empty:
-        df_airports.columns = [
+        expected_cols = [
             "Airport_ID",
             "Name",
             "City",
@@ -169,11 +248,14 @@ def load_and_clean_data():
             "Type",
             "Source",
         ]
+        if "Latitude" not in df_airports.columns:
+            df_airports.columns = expected_cols[: len(df_airports.columns)]
+
         df_airports["ICAO_clean"] = (
             df_airports["ICAO"].astype(str).str.strip().str.upper()
         )
 
-        # Merge met luchthavendata
+        # Merge op ICAO code van bestemming/herkomst
         df_merged = pd.merge(
             df_sched,
             df_airports[
@@ -189,18 +271,25 @@ def load_and_clean_data():
             on="ICAO_clean",
             how="left",
         )
-        # Afstand berekenen tot Schiphol
-        df_merged["Afstand_km"] = haversine_distance(
-            AMS_LAT, AMS_LON, df_merged["Latitude"], df_merged["Longitude"]
+
+        # Gevectoriseerde Haversine berekening vanaf Zürich Airport
+        df_merged["Afstand_km"] = haversine_distance_vectorized(
+            ZRH_LAT, ZRH_LON, df_merged["Latitude"], df_merged["Longitude"]
         )
     else:
         df_airports = pd.DataFrame()
         df_merged = df_sched
         df_merged["Afstand_km"] = np.nan
 
-    # C. KNMI Weather Data
+    # C. Meteostat Weerdata (Station 06670 Zürich-Kloten)
     df_weather = pd.DataFrame()
-    weather_paths = ["06670.csv.gz", "06670.csv", "data/06670.csv.gz"]
+    weather_paths = [
+        "06670.csv.gz",
+        "06670.csv",
+        "data/06670.csv.gz",
+        "data/06670.csv",
+    ]
+
     for wpath in weather_paths:
         if os.path.exists(wpath):
             try:
@@ -231,16 +320,18 @@ def load_and_clean_data():
         df_weather.columns = cols[: df_weather.shape[1]]
 
         df_weather["Weather_Date"] = pd.to_datetime(
-            df_weather["Datum_Str"], errors="coerce"
+            df_weather["Datum_Str"].astype(str), errors="coerce"
         )
-        df_weather["Temperatuur_C"] = (
-            df_weather["TG"] / 10.0
-        )  # KNMI is in 0.1 C
-        df_weather["Windsnelheid_m_s"] = (
-            df_weather["FH"] / 10.0
-        )  # KNMI wind is in 0.1 m/s
 
-        # Koppelen op datum
+        # Hulpconversies KNMI/Meteostat eenheden
+        df_weather["Temperatuur_C"] = (
+            df_weather["TG"] / 10.0 if df_weather["TG"].max() > 100 else df_weather["TG"]
+        )
+        df_weather["Windsnelheid_m_s"] = (
+            df_weather["FH"] / 10.0 if df_weather["FH"].max() > 100 else df_weather["FH"]
+        )
+
+        # Merge weergegevens op vluchtdatum
         df_merged = pd.merge(
             df_merged,
             df_weather[["Weather_Date", "Temperatuur_C", "Windsnelheid_m_s"]],
@@ -254,6 +345,7 @@ def load_and_clean_data():
 
 @st.cache_data
 def load_telemetry_file(filename):
+    """Leest een van de 7 gedetailleerde vluchttelemetriebestanden in uit flightdata.zip."""
     zip_paths = ["flightdata.zip", "data/flightdata.zip"]
     for zpath in zip_paths:
         if os.path.exists(zpath) and zipfile.is_zipfile(zpath):
@@ -266,23 +358,24 @@ def load_telemetry_file(filename):
     return pd.DataFrame()
 
 
+# Data inladen
 df, df_airports, df_weather = load_and_clean_data()
 
 # ==========================================
-# 4. SIDEBAR INTERACTIVE FILTERS
+# 4. INTERACTIEVE SIDEBAR FILTERS
 # ==========================================
-st.sidebar.header("🔍 Interactive Filters")
+st.sidebar.header("🔍 Dynamic Dashboard Filters")
 
 if not df.empty and "STD_DT" in df.columns:
     min_d, max_d = df["STD_DT"].min().date(), df["STD_DT"].max().date()
-    date_range = st.sidebar.date_input("Selecteer Datum Range", [min_d, max_d])
+    date_range = st.sidebar.date_input("Selecteer Datum Periode", [min_d, max_d])
 
     type_filter = st.sidebar.radio(
         "Vluchttype (LSV)",
-        ["Alles", "Inbound (L - Landend)", "Outbound (S - Vertrekkend)"],
+        ["Alles", "Inbound (L - Landing)", "Outbound (S - Start)"],
     )
 
-    act_list = ["Alles"] + sorted([x for x in df["ACT"].dropna().unique()])
+    act_list = ["Alles"] + sorted([str(x) for x in df["ACT"].dropna().unique()])
     act_filter = st.sidebar.selectbox("Vliegtuigtype (ACT)", act_list)
 
     rwy_list = ["Alles"] + sorted(
@@ -294,7 +387,7 @@ if not df.empty and "STD_DT" in df.columns:
         "Minimale Vertraging Filter (minuten)", -30, 180, 0
     )
 
-    # Toepassen van filters
+    # Filterlogica
     filtered_df = df.copy()
     if len(date_range) == 2:
         filtered_df = filtered_df[
@@ -305,7 +398,7 @@ if not df.empty and "STD_DT" in df.columns:
         code = "L" if "Inbound" in type_filter else "S"
         filtered_df = filtered_df[filtered_df["LSV"] == code]
     if act_filter != "Alles":
-        filtered_df = filtered_df[filtered_df["ACT"] == act_filter]
+        filtered_df = filtered_df[filtered_df["ACT"].astype(str) == act_filter]
     if rwy_filter != "Alles":
         filtered_df = filtered_df[filtered_df["RWY"].astype(str) == rwy_filter]
 
@@ -314,13 +407,13 @@ else:
     filtered_df = df
 
 # ==========================================
-# 5. EXECUTIVE KPI METRICS
+# 5. EXECUTIVE KPI HIGHLIGHT CARDS
 # ==========================================
 k1, k2, k3, k4, k5 = st.columns(5)
 
 with k1:
     st.metric(
-        label="📊 Geanalyseerde Vluchten", value=f"{len(filtered_df):,}"
+        label="📊 Totaal Vluchten", value=f"{len(filtered_df):,}"
     )
 with k2:
     avg_d = (
@@ -352,21 +445,21 @@ with k5:
 st.divider()
 
 # ==========================================
-# 6. DASHBOARD TABS
+# 6. HOOFDDASHBOARD TABS (RUBRIC STRUCTUUR)
 # ==========================================
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     [
         "📈 Tijdsanalyse & Trends",
         "🗺️ 3D Kaart & Afstanden",
-        "🌤️ Weerinvloed (KNMI)",
+        "🌤️ Weerinvloed (Meteostat 06670)",
         "🤖 Machine Learning Model",
         "🛫 Vluchttelemetrie & Data Inspectie",
     ]
 )
 
-# --- TAB 1: TIJDSANALYSE ---
+# --- TAB 1: TIJDSANALYSE & TRENDS ---
 with tab1:
-    st.subheader("📈 Verloop en Trends van Vertragingen")
+    st.subheader("📈 Verloop en Piekuren van Vertragingen op Zürich Airport")
 
     if not filtered_df.empty:
         col_t1, col_t2 = st.columns(2)
@@ -378,17 +471,17 @@ with tab1:
                 .reset_index()
             )
             df_m["LSV_Name"] = df_m["LSV"].map(
-                {"L": "Inbound (L)", "S": "Outbound (S)"}
+                {"L": "Inbound (L - Landing)", "S": "Outbound (S - Start)"}
             )
             fig_m = px.line(
                 df_m,
                 x="Maand",
                 y="Vertraging_Minuten",
                 color="LSV_Name",
-                title="Gemiddelde Vertraging per Maand (Inbound vs Outbound)",
+                title="Gemiddelde Vertraging per Maand (2019-2020)",
                 markers=True,
                 labels={
-                    "Vertraging_Minuten": "Gemiddelde Vertraging (min)",
+                    "Vertraging_Minuten": "Gem. Vertraging (min)",
                     "Maand": "Maand",
                 },
             )
@@ -407,6 +500,7 @@ with tab1:
                 color="Vertraging_Minuten",
                 title="Gemiddelde Vertraging per Uur van de Dag (Piekuren)",
                 color_continuous_scale="Reds",
+                labels={"Vertraging_Minuten": "Gem. Vertraging (min)", "Uur": "Uur van de dag"},
             )
             st.plotly_chart(fig_u, use_container_width=True)
 
@@ -416,8 +510,9 @@ with tab1:
                 filtered_df.dropna(subset=["RWY"]),
                 x="RWY",
                 y="Vertraging_Minuten",
-                title="Spreiding van Vertraging per Start-/Landingsbaan",
+                title="Spreiding van Vertraging per Start-/Landingsbaan op Zürich",
                 color="RWY",
+                labels={"RWY": "Baan Nummer", "Vertraging_Minuten": "Vertraging (min)"},
             )
             st.plotly_chart(fig_rwy, use_container_width=True)
 
@@ -443,14 +538,16 @@ with tab1:
                 x="DagVanWeek",
                 y="Vertraging_Minuten",
                 title="Gemiddelde Vertraging per Dag van de Week",
+                color="Vertraging_Minuten",
+                color_continuous_scale="Blues",
             )
             st.plotly_chart(fig_dow, use_container_width=True)
 
-# --- TAB 2: 3D KAART & AFSTANDEN ---
+# --- TAB 2: 3D GEOGRAFISCHE KAART & AFSTANDEN ---
 with tab2:
-    st.subheader("🗺️ Geografische Spreiding & Berekende Afstanden")
+    st.subheader("🗺️ 3D Vluchtroutes & Geografische Spreiding vanaf Zürich Airport (ZRH)")
     st.markdown(
-        "De afstanden worden berekend met behulp van de **Haversine formule** tussen Schiphol en buitenlandse luchthavens."
+        "De afstanden worden gevectoriseerd berekend met de **Vincenty / Haversine afstandsformule** tussen Zürich Airport (`LSZH`) en de buitenlandse bestemmingen."
     )
 
     df_map = filtered_df.dropna(subset=["Latitude", "Longitude"]).copy()
@@ -476,24 +573,25 @@ with tab2:
         )
 
         view_state = pdk.ViewState(
-            latitude=52.3105, longitude=4.7683, zoom=3, pitch=40
+            latitude=ZRH_LAT, longitude=ZRH_LON, zoom=3, pitch=45
         )
 
-        layer = pdk.Layer(
+        # PyDeck Scatter Layer
+        layer_scatter = pdk.Layer(
             "ScatterplotLayer",
             data=df_geo,
             get_position="[Longitude, Latitude]",
             get_color="[220, 50, 30, 180]",
-            get_radius="Aantal_Vluchten * 150 + 20000",
+            get_radius="Aantal_Vluchten * 120 + 15000",
             pickable=True,
         )
 
         st.pydeck_chart(
             pdk.Deck(
-                layers=[layer],
+                layers=[layer_scatter],
                 initial_view_state=view_state,
                 tooltip={
-                    "text": "Luchthaven: {Name} ({Org/Des})\nStad/Land: {City}, {Country}\nBerekende Afstand: {Afstand_km:.0f} km\nAantal Vluchten: {Aantal_Vluchten}\nGem. Vertraging: {Gem_Vertraging:.1f} min"
+                    "text": "Luchthaven: {Name} ({Org/Des})\nStad/Land: {City}, {Country}\nAfstand: {Afstand_km:.0f} km\nAantal Vluchten: {Aantal_Vluchten}\nGem. Vertraging: {Gem_Vertraging:.1f} min"
                 },
             )
         )
@@ -505,16 +603,20 @@ with tab2:
             size="Aantal_Vluchten",
             color="Country",
             hover_name="Name",
-            title="Relatie tussen Vluchtafstand (km) en Vertraging (minuten)",
+            title="Relatie tussen Vluchtafstand vanaf Zürich (km) en Vertraging (minuten)",
             trendline="ols",
+            labels={
+                "Afstand_km": "Afstand vanaf Zürich (km)",
+                "Gem_Vertraging": "Gemiddelde Vertraging (min)",
+            },
         )
         st.plotly_chart(fig_dist, use_container_width=True)
 
-# --- TAB 3: WEERINVLOED (KNMI) ---
+# --- TAB 3: WEERINVLOED (METEOSTAT STATION 06670 ZÜRICH-KLOTEN) ---
 with tab3:
-    st.subheader("🌤️ Invloed van KNMI Weergegevens op Vertragingen")
+    st.subheader("🌤️ Invloed van Meteostat Weergegevens op Vertragingen")
     st.markdown(
-        "Analyse van dagelijkse temperatuur en windsnelheid gemeten op Schiphol (`06670.csv.gz`)."
+        "Koppeling van dagelijkse KNMI/Meteostat weergegevens gemeten op station **06670 (Zürich-Kloten)**."
     )
 
     if (
@@ -538,7 +640,7 @@ with tab3:
                 df_w_daily,
                 x="Windsnelheid",
                 y="Gem_Vertraging",
-                title="Windsnelheid (m/s) vs. Dagelijkse Vertraging",
+                title="Windsnelheid op Zürich (m/s) vs. Dagelijkse Vertraging",
                 trendline="ols",
                 labels={
                     "Windsnelheid": "Windsnelheid (m/s)",
@@ -552,7 +654,7 @@ with tab3:
                 df_w_daily,
                 x="Temperatuur",
                 y="Gem_Vertraging",
-                title="Temperatuur (°C) vs. Dagelijkse Vertraging",
+                title="Temperatuur op Zürich (°C) vs. Dagelijkse Vertraging",
                 trendline="ols",
                 labels={
                     "Temperatuur": "Temperatuur (°C)",
@@ -563,9 +665,9 @@ with tab3:
 
 # --- TAB 4: MACHINE LEARNING MODEL ---
 with tab4:
-    st.subheader("🤖 Machine Learning Vertraging Voorspellen")
+    st.subheader("🤖 Machine Learning: Vertraging Voorspellen op Zürich Airport")
     st.markdown(
-        "Een **Scikit-Learn Gradient Boosting** model getraind op de werkelijke historische vlucht- en weerdata."
+        "Een **Scikit-Learn Gradient Boosting Regressor** getraind op historische vlucht- en weerparameters."
     )
 
     @st.cache_resource
@@ -586,8 +688,8 @@ with tab4:
             .dropna()
             .copy()
         )
-        if len(ml_data) > 40000:
-            ml_data = ml_data.sample(n=40000, random_state=42)
+        if len(ml_data) > 50000:
+            ml_data = ml_data.sample(n=50000, random_state=42)
 
         cat_cols = ["LSV", "ACT", "RWY"]
         encoder = OrdinalEncoder(
@@ -613,9 +715,7 @@ with tab4:
         return model, encoder, mae, rmse, r2, list(X.columns)
 
     if not df.empty:
-        with st.spinner(
-            "Model aan het trainen op echte vlucht- en weerdata..."
-        ):
+        with st.spinner("Model wordt getraind op de data van Zürich..."):
             model, encoder, mae, rmse, r2, feature_names = train_ml_model(df)
 
         m1, m2, m3 = st.columns(3)
@@ -624,32 +724,32 @@ with tab4:
         m3.metric("Model R² Score", f"{r2:.4f}")
 
         st.divider()
-        st.markdown("#### 🔮 Doe een Interactieve Voorspelling")
+        st.markdown("#### 🔮 Interactieve Vertragingsvoorspeller")
 
         col_p1, col_p2, col_p3 = st.columns(3)
         with col_p1:
             in_lsv = st.selectbox(
-                "Vluchttype", ["L (Inbound)", "S (Outbound)"]
+                "Vluchttype", ["L (Landing/Inbound)", "S (Start/Outbound)"]
             )
             in_act = st.selectbox(
                 "Vliegtuigtype",
                 sorted([str(x) for x in df["ACT"].dropna().unique()]),
             )
-            in_uur = st.slider("Vertrekuur", 0, 23, 14)
+            in_uur = st.slider("Vertrek-/Aankomstuur", 0, 23, 14)
         with col_p2:
             in_rwy = st.selectbox(
                 "Landings/Startbaan",
                 sorted([str(x) for x in df["RWY"].dropna().unique()]),
             )
             in_dist = st.number_input(
-                "Afstand tot Bestemming (km)", 100, 15000, 1500
+                "Vluchtafstand tot Zürich (km)", 100, 15000, 1200
             )
         with col_p3:
             in_wind = st.slider("Verwachte Windsnelheid (m/s)", 0, 30, 8)
             in_temp = st.slider("Verwachte Temperatuur (°C)", -10, 35, 18)
 
         if st.button("🚀 Bereken Voorspelde Vertraging"):
-            lsv_code = "L" if "Inbound" in in_lsv else "S"
+            lsv_code = "L" if "Landing" in in_lsv else "S"
             input_row = pd.DataFrame(
                 [
                     [
@@ -670,59 +770,87 @@ with tab4:
 
             pred_delay = model.predict(input_row)[0]
             st.success(
-                f"Voorspelde Vertraging: **{pred_delay:.1f} minuten**"
+                f"Voorspelde Vertraging voor deze vlucht: **{pred_delay:.1f} minuten**"
             )
 
-# --- TAB 5: TELEMETRIE & DATA INSPECTIE ---
+# --- TAB 5: VLUCHTTELEMETRIE & DATA INSPECTIE ---
 with tab5:
-    st.subheader("🛫 Vluchttelemetrie & Data Inspectie")
+    st.subheader("🛫 Hoge-Resolutie Vluchttelemetrie & Opschoning")
+    st.markdown(
+        "Analyse van de **7 gedetailleerde vluchtbestanden** uit `flightdata.zip` (meting per seconde / 30 seconden)."
+    )
 
     zip_paths = ["flightdata.zip", "data/flightdata.zip"]
     found_telemetry = False
     for zpath in zip_paths:
         if os.path.exists(zpath) and zipfile.is_zipfile(zpath):
-            st.markdown("#### Vluchttelemetrie Analyse")
             try:
                 with zipfile.ZipFile(zpath, "r") as z:
                     f_list = sorted([f for f in z.namelist() if f.endswith(".xlsx")])
 
-                sel_f = st.selectbox("Selecteer Telemetrie Bestand", f_list)
-                if sel_f:
-                    df_tel = load_telemetry_file(sel_f)
-                    st.write(f"Datapunten in gekozen vlucht: **{len(df_tel):,}**")
+                if f_list:
+                    sel_f = st.selectbox("Selecteer Telemetrie Bestand", f_list)
+                    if sel_f:
+                        df_tel = load_telemetry_file(sel_f)
+                        st.write(
+                            f"Datapunten in dit telemetriebestand: **{len(df_tel):,}**"
+                        )
 
-                    col_f1, col_f2 = st.columns(2)
-                    with col_f1:
-                        if "[3d Altitude Ft]" in df_tel.columns:
-                            fig_alt = px.line(
-                                df_tel,
-                                x="Time (secs)",
-                                y="[3d Altitude Ft]",
-                                title="Hoogteverloop (Feet) over Tijd",
-                            )
-                            st.plotly_chart(fig_alt, use_container_width=True)
-                    with col_f2:
-                        if "TRUE AIRSPEED (derived)" in df_tel.columns:
-                            fig_sp = px.line(
-                                df_tel,
-                                x="Time (secs)",
-                                y="TRUE AIRSPEED (derived)",
-                                title="Luchtsnelheid over Tijd",
-                            )
-                            st.plotly_chart(fig_sp, use_container_width=True)
+                        col_f1, col_f2 = st.columns(2)
+                        with col_f1:
+                            alt_col = [
+                                c for c in df_tel.columns if "Altitude" in c
+                            ]
+                            time_col = [
+                                c for c in df_tel.columns if "Time" in c
+                            ]
+                            if alt_col and time_col:
+                                fig_alt = px.line(
+                                    df_tel,
+                                    x=time_col[0],
+                                    y=alt_col[0],
+                                    title="Hoogteverloop (Feet) gedurende de Vlucht",
+                                )
+                                st.plotly_chart(
+                                    fig_alt, use_container_width=True
+                                )
+                        with col_f2:
+                            speed_col = [
+                                c
+                                for c in df_tel.columns
+                                if "SPEED" in c.upper() or "SPEED" in c
+                            ]
+                            if speed_col and time_col:
+                                fig_sp = px.line(
+                                    df_tel,
+                                    x=time_col[0],
+                                    y=speed_col[0],
+                                    title="Snelheid (Airspeed) over de Tijd",
+                                )
+                                st.plotly_chart(
+                                    fig_sp, use_container_width=True
+                                )
+
+                        st.dataframe(df_tel.head(100), use_container_width=True)
                 found_telemetry = True
                 break
             except Exception:
                 pass
 
+    if not found_telemetry:
+        st.info(
+            "Plaats `flightdata.zip` in de map als je de 7 telemetriebestanden wilt analyseren."
+        )
+
     st.divider()
-    st.markdown("#### 📋 Opschonde Dataset Inspectie & Exporteren")
+    st.markdown("#### 📋 Geconverteerde & Opschoonde Dataset Inspectie")
     st.dataframe(filtered_df.head(500), use_container_width=True)
 
     csv_bytes = filtered_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="📥 Download Gefilterde Dataset als CSV",
+        label="📥 Download Gefilterde & Opschoonde Dataset als CSV",
         data=csv_bytes,
-        file_name="opschonde_schiphol_vluchtdata.csv",
+        file_name="zurich_flight_data_cleaned.csv",
         mime="text/csv",
     )
+    
